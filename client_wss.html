@@ -4,6 +4,12 @@
     <meta charset="utf-8">
     <title>WebSocket Audio Transcription</title>
     <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 20px auto;
+            padding: 20px;
+        }
         #transcriptionResult {
             white-space: pre-wrap; /* Preserve whitespace and line breaks */
             background-color: #f5f5f5;
@@ -11,36 +17,98 @@
             border: 1px solid #ddd;
             border-radius: 5px;
             font-family: monospace;
+            min-height: 100px;
+            max-height: 400px;
+            overflow-y: auto;
         }
         #recordButton.recording {
             background-color: red;
             color: white;
         }
+        #connectionStatus {
+            display: inline-block;
+            padding: 5px 10px;
+            border-radius: 3px;
+            margin-left: 10px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        #connectionStatus.connecting {
+            background-color: #ffa500;
+            color: white;
+        }
+        #connectionStatus.connected {
+            background-color: #4CAF50;
+            color: white;
+        }
+        #connectionStatus.disconnected {
+            background-color: #9e9e9e;
+            color: white;
+        }
+        #connectionStatus.error {
+            background-color: #f44336;
+            color: white;
+        }
+        #errorMessage {
+            color: #f44336;
+            background-color: #ffebee;
+            padding: 10px;
+            border-radius: 5px;
+            margin: 10px 0;
+            display: none;
+        }
+        #errorMessage.show {
+            display: block;
+        }
+        .control-group {
+            margin: 10px 0;
+        }
+        label {
+            margin-right: 15px;
+        }
     </style>
 </head>
 <body>
     <div>
-        <button id="recordButton">Start Recording</button>
-        <label>
-            language: 
-            <input id="lang" type="text" value="auto" />
-        </label>
-        <label>
-            <input type="checkbox" id="speakerVerification"> Speaker Verification
-        </label>
+        <div class="control-group">
+            <button id="recordButton">Start Recording</button>
+            <span id="connectionStatus" class="disconnected">未连接</span>
+        </div>
+        <div id="errorMessage"></div>
+        <div class="control-group">
+            <label>
+                Server URL: 
+                <input id="serverUrl" type="text" value="wss://port8034.deeplearning-use-1-tr034784-0-svc.gps.cloud.ctripcorp.com/ws/transcribe" style="width: 500px;" />
+            </label>
+        </div>
+        <div class="control-group">
+            <label>
+                Language: 
+                <input id="lang" type="text" value="auto" />
+            </label>
+            <label>
+                <input type="checkbox" id="speakerVerification"> Speaker Verification
+            </label>
+        </div>
         <hr />
-        Transcription result will be displayed below:
-        <p id="transcriptionResult"></p>
+        <div>
+            <strong>Transcription result:</strong>
+            <p id="transcriptionResult"></p>
+        </div>
     </div>
 </body>
 <script>
     var recordButton = document.getElementById('recordButton');
     var transcriptionResult = document.getElementById('transcriptionResult');
+    var connectionStatus = document.getElementById('connectionStatus');
+    var errorMessage = document.getElementById('errorMessage');
+    var serverUrlInput = document.getElementById('serverUrl');
     navigator.getUserMedia = navigator.getUserMedia || navigator.webkitGetUserMedia;
     var ws = null;
     var record = null;
     var timeInte = null;
     var isRecording = false;
+    var connectionTimeout = null;
 
     recordButton.onclick = function() {
         if (!isRecording) {
@@ -50,82 +118,226 @@
         }
     };
 
+    function updateConnectionStatus(status, text) {
+        connectionStatus.className = status;
+        connectionStatus.textContent = text;
+    }
+
+    function showError(message) {
+        errorMessage.textContent = message;
+        errorMessage.classList.add('show');
+        setTimeout(function() {
+            errorMessage.classList.remove('show');
+        }, 5000);
+    }
+
+    function hideError() {
+        errorMessage.classList.remove('show');
+    }
+
     function startRecording() {
+        if (!record) {
+            showError('录音器未初始化，请刷新页面重试');
+            return;
+        }
+
         console.log('Start Recording');
+        hideError();
+        
         var speakerVerificationCheckbox = document.getElementById('speakerVerification');
         var sv = speakerVerificationCheckbox.checked ? 1 : 0;
-        var lang = document.getElementById("lang").value
+        var lang = document.getElementById("lang").value;
+        
         // Construct the query parameters
         var queryParams = [];
         if (lang) {
-            queryParams.push(`lang=${lang}`);
+            queryParams.push('lang=' + encodeURIComponent(lang));
         }
         if (sv) {
             queryParams.push('sv=1');
         }
-        var queryString = queryParams.length > 0 ? `?${queryParams.join('&')}` : '';
+        var queryString = queryParams.length > 0 ? '?' + queryParams.join('&') : '';
 
-        ws = new WebSocket(`wss://port8034.deeplearning-use-1-tr034784-0-svc.gps.cloud.ctripcorp.com/ws/transcribe${queryString}`);
-        ws.binaryType = 'arraybuffer';
+        var serverUrl = serverUrlInput.value.trim();
+        if (!serverUrl) {
+            showError('服务器地址不能为空');
+            return;
+        }
 
-        ws.onopen = function(event) {
-            console.log('WebSocket connection established');
-            record.start();
-            timeInte = setInterval(function() {
-                if(ws.readyState === 1) {
-                    var audioBlob = record.getBlob();
-                    console.log('Blob size: ', audioBlob.size);
+        // 移除末尾的 /ws/transcribe（如果存在），因为会在后面添加
+        serverUrl = serverUrl.replace(/\/ws\/transcribe\/?$/, '');
+        var wsUrl = serverUrl + '/ws/transcribe' + queryString;
 
-                    // Read the Blob content for debugging
-                    var reader = new FileReader();
-                    reader.onloadend = function() {
-                        console.log('Blob content: ', new Uint8Array(reader.result));
-                        ws.send(audioBlob);
-                        console.log('Sending audio data');
-                        record.clear();
-                    };
-                    reader.readAsArrayBuffer(audioBlob);
-                }
-            }, 500);
-        };
+        console.log('Connecting to: ' + wsUrl);
+        updateConnectionStatus('connecting', '连接中...');
 
-        ws.onmessage = function(evt) {
-            console.log('Received message: ' + evt.data);
-            try {
-                resJson = JSON.parse(evt.data)
-                if (resJson.code == 0) {
-                    var jsonResponse = JSON.stringify(resJson, null, 4);
-                    transcriptionResult.textContent += "\n" + (resJson.data || 'No speech recognized');
-                }
-            } catch (e) {
-                console.error('Failed to parse response data', e);
-                transcriptionResult.textContent += "\n" + evt.data;
+        // 设置连接超时（10秒）
+        connectionTimeout = setTimeout(function() {
+            if (ws && ws.readyState === WebSocket.CONNECTING) {
+                ws.close();
+                updateConnectionStatus('error', '连接超时');
+                showError('连接服务器超时，请检查服务器地址是否正确');
+                stopRecording();
             }
-        };
+        }, 10000);
 
-        ws.onclose = function() {
-            console.log('WebSocket connection closed');
-        };
+        try {
+            ws = new WebSocket(wsUrl);
+            ws.binaryType = 'arraybuffer';
 
-        ws.onerror = function(error) {
-            console.error('WebSocket error: ' + error);
-        };
+            ws.onopen = function(event) {
+                console.log('WebSocket connection established');
+                clearTimeout(connectionTimeout);
+                updateConnectionStatus('connected', '已连接');
+                hideError();
+                
+                if (record) {
+                    record.start();
+                    timeInte = setInterval(function() {
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            var audioBlob = record.getBlob();
+                            console.log('Blob size: ', audioBlob.size);
 
-        recordButton.textContent = "Stop Recording";
-        recordButton.classList.add("recording");
-        isRecording = true;
+                            // Read the Blob content for debugging
+                            var reader = new FileReader();
+                            reader.onloadend = function() {
+                                console.log('Blob content: ', new Uint8Array(reader.result));
+                                if (ws && ws.readyState === WebSocket.OPEN) {
+                                    ws.send(audioBlob);
+                                    console.log('Sending audio data');
+                                    record.clear();
+                                }
+                            };
+                            reader.onerror = function(e) {
+                                console.error('Error reading blob:', e);
+                            };
+                            reader.readAsArrayBuffer(audioBlob);
+                        }
+                    }, 500);
+                } else {
+                    showError('录音器未初始化');
+                    stopRecording();
+                }
+            };
+
+            ws.onmessage = function(evt) {
+                console.log('Received message: ' + evt.data);
+                try {
+                    var resJson = JSON.parse(evt.data);
+                    
+                    // 处理不同的响应码
+                    if (resJson.code === 0) {
+                        // 成功：显示转录结果
+                        var text = resJson.data || 'No speech recognized';
+                        transcriptionResult.textContent += "\n" + text;
+                        hideError();
+                    } else if (resJson.code === 2) {
+                        // 检测到语音或说话人
+                        var info = resJson.info || '';
+                        var data = resJson.data || '';
+                        var message = info + (data ? ' (' + data + ')' : '');
+                        console.log('Speech/Speaker detected: ' + message);
+                        transcriptionResult.textContent += "\n[检测] " + message;
+                    } else if (resJson.code >= 400) {
+                        // 错误：显示错误信息
+                        var errorInfo = resJson.info || 'Unknown error';
+                        showError('服务器错误 (code: ' + resJson.code + '): ' + errorInfo);
+                        transcriptionResult.textContent += "\n[错误] " + errorInfo;
+                        
+                        // 如果是严重错误，关闭连接
+                        if (resJson.code >= 500) {
+                            setTimeout(function() {
+                                stopRecording();
+                            }, 1000);
+                        }
+                    } else {
+                        // 其他未知响应码
+                        console.warn('Unknown response code:', resJson.code);
+                        transcriptionResult.textContent += "\n[未知响应] " + JSON.stringify(resJson);
+                    }
+                } catch (e) {
+                    console.error('Failed to parse response data', e);
+                    transcriptionResult.textContent += "\n[解析错误] " + evt.data;
+                }
+            };
+
+            ws.onclose = function(event) {
+                console.log('WebSocket connection closed', event);
+                clearTimeout(connectionTimeout);
+                
+                if (event.wasClean) {
+                    updateConnectionStatus('disconnected', '已断开');
+                } else {
+                    updateConnectionStatus('error', '连接异常断开');
+                    if (event.code !== 1000) {
+                        var closeReason = '连接关闭 (code: ' + event.code;
+                        if (event.reason) {
+                            closeReason += ', reason: ' + event.reason;
+                        }
+                        closeReason += ')';
+                        showError(closeReason);
+                    }
+                }
+                
+                // 如果还在录音状态，停止录音
+                if (isRecording) {
+                    stopRecording();
+                }
+            };
+
+            ws.onerror = function(error) {
+                console.error('WebSocket error:', error);
+                clearTimeout(connectionTimeout);
+                updateConnectionStatus('error', '连接错误');
+                showError('WebSocket连接错误，请检查服务器地址和网络连接');
+            };
+
+            recordButton.textContent = "Stop Recording";
+            recordButton.classList.add("recording");
+            isRecording = true;
+        } catch (e) {
+            console.error('Error creating WebSocket:', e);
+            updateConnectionStatus('error', '连接失败');
+            showError('创建WebSocket连接失败: ' + e.message);
+            stopRecording();
+        }
     }
 
     function stopRecording() {
         console.log('Stop Recording');
-        if (ws) {
-            ws.close();
-            record.stop();
-            clearInterval(timeInte);
+        
+        if (connectionTimeout) {
+            clearTimeout(connectionTimeout);
+            connectionTimeout = null;
         }
+        
+        if (timeInte) {
+            clearInterval(timeInte);
+            timeInte = null;
+        }
+        
+        if (record) {
+            record.stop();
+        }
+        
+        if (ws) {
+            try {
+                if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+                    ws.close(1000, 'User stopped recording');
+                }
+            } catch (e) {
+                console.error('Error closing WebSocket:', e);
+            }
+            ws = null;
+        }
+        
         recordButton.textContent = "Start Recording";
         recordButton.classList.remove("recording");
         isRecording = false;
+        
+        if (connectionStatus.className !== 'error') {
+            updateConnectionStatus('disconnected', '未连接');
+        }
     }
 
     function init(rec) {
@@ -133,15 +345,31 @@
     }
 
     if (!navigator.getUserMedia) {
+        showError('您的浏览器不支持音频输入');
         alert('Your browser does not support audio input');
     } else {
         navigator.getUserMedia(
             { audio: true },
             function(mediaStream) {
-                init(new Recorder(mediaStream));
+                try {
+                    init(new Recorder(mediaStream));
+                    console.log('Recorder initialized successfully');
+                } catch (e) {
+                    console.error('Error initializing recorder:', e);
+                    showError('初始化录音器失败: ' + e.message);
+                }
             },
             function(error) {
-                console.log(error);
+                console.error('Error getting user media:', error);
+                var errorMsg = '无法访问麦克风';
+                if (error.name === 'NotAllowedError') {
+                    errorMsg = '麦克风访问被拒绝，请允许浏览器访问麦克风';
+                } else if (error.name === 'NotFoundError') {
+                    errorMsg = '未找到麦克风设备';
+                } else if (error.name === 'NotReadableError') {
+                    errorMsg = '麦克风被其他应用占用';
+                }
+                showError(errorMsg);
             }
         );
     }
