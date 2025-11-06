@@ -2,3 +2,7 @@
 run.log
 __pycache__
 speaker/speaker_tf_16k.wav
+
+log/
+venv/
+.idea/
