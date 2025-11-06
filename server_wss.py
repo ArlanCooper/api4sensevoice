@@ -262,7 +262,7 @@ async def custom_exception_handler(request: Request, exc: Exception):
         status_code=status_code,
         content=TranscriptionResponse(
             code=status_code,
-            msg=message,
+            info=message,
             data=data
         ).model_dump()
     )
