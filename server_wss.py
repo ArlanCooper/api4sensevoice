@@ -12,9 +12,7 @@ import argparse
 import uvicorn
 from urllib.parse import parse_qs
 import os
-import re
 from modelscope.pipelines import pipeline
-from modelscope.utils.constant import Tasks
 from loguru import logger
 import sys
 import json
@@ -152,23 +150,12 @@ def format_str_v3(s):
 	new_s = new_s.replace("The.", " ")
 	return new_s.strip()
 
-def contains_chinese_english_number(s: str) -> bool:
-    # Check if the string contains any Chinese character, English letter, or Arabic number
-    return bool(re.search(r'[\u4e00-\u9fffA-Za-z0-9]', s))
 
 
 sv_pipeline = pipeline(
     task='speaker-verification',
     model='iic/speech_eres2net_large_sv_zh-cn_3dspeaker_16k',
     model_revision='v1.0.0'
-)
-
-asr_pipeline = pipeline(
-    task=Tasks.auto_speech_recognition,
-    model='iic/SenseVoiceSmall',
-    model_revision="master",
-    device="cuda:0",
-    disable_update=True
 )
 
 model_asr = AutoModel(
@@ -195,24 +182,41 @@ reg_spks_files = [
 def reg_spk_init(files):
     reg_spk = {}
     for f in files:
-        data, sr = sf.read(f, dtype="float32")
-        k, _ = os.path.splitext(os.path.basename(f))
-        reg_spk[k] = {
-            "data": data,
-            "sr":   sr,
-        }
+        try:
+            if not os.path.exists(f):
+                logger.warning(f"Speaker file not found: {f}, skipping...")
+                continue
+            data, sr = sf.read(f, dtype="float32")
+            k, _ = os.path.splitext(os.path.basename(f))
+            reg_spk[k] = {
+                "data": data,
+                "sr":   sr,
+            }
+            logger.info(f"Successfully loaded speaker file: {f}")
+        except Exception as e:
+            logger.error(f"Failed to load speaker file {f}: {e}")
+            continue
     return reg_spk
 
-reg_spks = reg_spk_init(reg_spks_files)
+try:
+    reg_spks = reg_spk_init(reg_spks_files)
+    if not reg_spks:
+        logger.warning("No valid speaker files loaded. Speaker verification will not work.")
+except Exception as e:
+    logger.error(f"Failed to initialize speaker files: {e}")
+    reg_spks = {}
 
 def speaker_verify(audio, sv_thr):
     hit = False
+    speaker = None
     for k, v in reg_spks.items():
         res_sv = sv_pipeline([audio, v["data"]], sv_thr)
         if res_sv["score"] >= sv_thr:
            hit = True
+           speaker = k
+           break  # 找到匹配的说话人后立即返回
         logger.info(f"[speaker_verify] audio_len: {len(audio)}; sv_thr: {sv_thr}; hit: {hit}; {k}: {res_sv}")
-    return hit, k
+    return hit, speaker
 
 
 def asr(audio, lang, cache, use_itn=False):
@@ -275,39 +279,83 @@ class TranscriptionResponse(BaseModel):
 
 @app.websocket("/ws/transcribe")
 async def websocket_endpoint(websocket: WebSocket):
+    audio_buffer = np.array([], dtype=np.float32)
+    audio_vad = np.array([], dtype=np.float32)
+    cache = {}
+    cache_asr = {}
+    
     try:
         query_params = parse_qs(websocket.scope['query_string'].decode())
         sv = query_params.get('sv', ['false'])[0].lower() in ['true', '1', 't', 'y', 'yes']
         lang = query_params.get('lang', ['auto'])[0].lower()
         
+        # 验证说话人验证配置
+        if sv and not reg_spks:
+            await websocket.accept()
+            error_response = TranscriptionResponse(
+                code=400,
+                info="Speaker verification is enabled but no speaker files are loaded",
+                data=""
+            )
+            await websocket.send_json(error_response.model_dump())
+            await websocket.close()
+            return
+        
         await websocket.accept()
         chunk_size = int(config.chunk_size_ms * config.sample_rate / 1000)
-        audio_buffer = np.array([], dtype=np.float32)
-        audio_vad = np.array([], dtype=np.float32)
+        if chunk_size <= 0:
+            error_response = TranscriptionResponse(
+                code=500,
+                info="Invalid chunk size configuration",
+                data=""
+            )
+            await websocket.send_json(error_response.model_dump())
+            await websocket.close()
+            return
 
-        cache = {}
-        cache_asr = {}
         last_vad_beg = last_vad_end = -1
         offset = 0
         hit = False
+        speech_detected_sent = False  # 防止重复发送检测消息
         
         buffer = b""
         while True:
-            data = await websocket.receive_bytes()
-            # logger.info(f"received {len(data)} bytes")
-
+            try:
+                data = await websocket.receive_bytes()
+            except Exception as e:
+                logger.error(f"Error receiving data: {e}")
+                error_response = TranscriptionResponse(
+                    code=500,
+                    info=f"Error receiving audio data: {str(e)}",
+                    data=""
+                )
+                try:
+                    await websocket.send_json(error_response.model_dump())
+                except:
+                    pass
+                break
             
             buffer += data
             if len(buffer) < 2:
                 continue
                 
-            audio_buffer = np.append(
-                audio_buffer, 
-                np.frombuffer(buffer[:len(buffer) - (len(buffer) % 2)], dtype=np.int16).astype(np.float32) / 32767.0
-            )
-            
-            # with open('buffer.pcm', 'ab') as f:
-            #     logger.debug(f'write {f.write(buffer[:len(buffer) - (len(buffer) % 2)])} bytes to `buffer.pcm`')
+            try:
+                audio_buffer = np.append(
+                    audio_buffer, 
+                    np.frombuffer(buffer[:len(buffer) - (len(buffer) % 2)], dtype=np.int16).astype(np.float32) / 32767.0
+                )
+            except Exception as e:
+                logger.error(f"Error processing audio buffer: {e}")
+                error_response = TranscriptionResponse(
+                    code=500,
+                    info=f"Error processing audio data: {str(e)}",
+                    data=""
+                )
+                try:
+                    await websocket.send_json(error_response.model_dump())
+                except:
+                    pass
+                continue
                 
             buffer = buffer[len(buffer) - (len(buffer) % 2):]
    
@@ -315,24 +363,38 @@ async def websocket_endpoint(websocket: WebSocket):
                 chunk = audio_buffer[:chunk_size]
                 audio_buffer = audio_buffer[chunk_size:]
                 audio_vad = np.append(audio_vad, chunk)
-                
-                # with open('chunk.pcm', 'ab') as f:
-                #     logger.debug(f'write {f.write(chunk)} bytes to `chunk.pcm`')
                     
-                if last_vad_beg > 1:
+                if last_vad_beg > 1 and not speech_detected_sent:
                     if sv:
                         # speaker verify
                         # If no hit is detected, continue accumulating audio data and check again until a hit is detected
                         # `hit` will reset after `asr`.
                         if not hit:
-                            hit, speaker = speaker_verify(audio_vad[int((last_vad_beg - offset) * config.sample_rate / 1000):], config.sv_thr)
-                            if hit:
-                                response = TranscriptionResponse(
-                                    code=2,
-                                    info="detect speaker",
-                                    data=speaker
+                            try:
+                                vad_start_idx = int((last_vad_beg - offset) * config.sample_rate / 1000)
+                                if vad_start_idx < 0 or vad_start_idx >= len(audio_vad):
+                                    logger.warning(f"Invalid VAD start index: {vad_start_idx}, audio_vad length: {len(audio_vad)}")
+                                    continue
+                                hit, speaker = speaker_verify(audio_vad[vad_start_idx:], config.sv_thr)
+                                if hit:
+                                    response = TranscriptionResponse(
+                                        code=2,
+                                        info="detect speaker",
+                                        data=speaker if speaker else "unknown"
+                                    )
+                                    await websocket.send_json(response.model_dump())
+                                    speech_detected_sent = True
+                            except Exception as e:
+                                logger.error(f"Error in speaker verification: {e}")
+                                error_response = TranscriptionResponse(
+                                    code=500,
+                                    info=f"Speaker verification error: {str(e)}",
+                                    data=""
                                 )
-                                await websocket.send_json(response.model_dump())
+                                try:
+                                    await websocket.send_json(error_response.model_dump())
+                                except:
+                                    pass
                     else:
                         response = TranscriptionResponse(
                             code=2,
@@ -340,10 +402,25 @@ async def websocket_endpoint(websocket: WebSocket):
                             data=''
                         )
                         await websocket.send_json(response.model_dump())
+                        speech_detected_sent = True
 
-                res = model_vad.generate(input=chunk, cache=cache, is_final=False, chunk_size=config.chunk_size_ms)
+                try:
+                    res = model_vad.generate(input=chunk, cache=cache, is_final=False, chunk_size=config.chunk_size_ms)
+                except Exception as e:
+                    logger.error(f"Error in VAD processing: {e}")
+                    error_response = TranscriptionResponse(
+                        code=500,
+                        info=f"VAD processing error: {str(e)}",
+                        data=""
+                    )
+                    try:
+                        await websocket.send_json(error_response.model_dump())
+                    except:
+                        pass
+                    continue
+                    
                 # logger.info(f"vad inference: {res}")
-                if len(res[0]["value"]):
+                if len(res) > 0 and len(res[0]["value"]):
                     vad_segments = res[0]["value"]
                     for segment in vad_segments:
                         if segment[0] > -1: # speech begin
@@ -356,32 +433,84 @@ async def websocket_endpoint(websocket: WebSocket):
                             offset += last_vad_end
                             beg = int(last_vad_beg * config.sample_rate / 1000)
                             end = int(last_vad_end * config.sample_rate / 1000)
+                            
+                            # 边界检查
+                            if beg < 0 or end < beg or end > len(audio_vad):
+                                logger.warning(f"Invalid VAD segment: beg={beg}, end={end}, audio_vad_len={len(audio_vad)}")
+                                audio_vad = audio_vad[max(0, end):] if end < len(audio_vad) else np.array([], dtype=np.float32)
+                                last_vad_beg = last_vad_end = -1
+                                hit = False
+                                speech_detected_sent = False
+                                continue
+                            
                             logger.info(f"[vad segment] audio_len: {end - beg}")
-                            result = None if sv and not hit else asr(audio_vad[beg:end], lang.strip(), cache_asr, True)
-                            logger.info(f"asr response: {result}")
+                            
+                            try:
+                                result = None if sv and not hit else asr(audio_vad[beg:end], lang.strip(), cache_asr, True)
+                                logger.info(f"asr response: {result}")
+                            except Exception as e:
+                                logger.error(f"Error in ASR processing: {e}")
+                                error_response = TranscriptionResponse(
+                                    code=500,
+                                    info=f"ASR processing error: {str(e)}",
+                                    data=""
+                                )
+                                try:
+                                    await websocket.send_json(error_response.model_dump())
+                                except:
+                                    pass
+                                result = None
+                            
                             audio_vad = audio_vad[end:]
                             last_vad_beg = last_vad_end = -1
                             hit = False
+                            speech_detected_sent = False
                             
-                            if  result is not None:
-                                response = TranscriptionResponse(
-                                    code=0,
-                                    info=json.dumps(result[0], ensure_ascii=False),
-                                    data=format_str_v3(result[0]['text'])
-                                )
-                                await websocket.send_json(response.model_dump())
+                            if result is not None:
+                                try:
+                                    formatted_text = format_str_v3(result[0]['text']) if result and len(result) > 0 and 'text' in result[0] else ""
+                                    response = TranscriptionResponse(
+                                        code=0,
+                                        info=json.dumps(result[0], ensure_ascii=False) if result and len(result) > 0 else "",
+                                        data=formatted_text
+                                    )
+                                    await websocket.send_json(response.model_dump())
+                                except Exception as e:
+                                    logger.error(f"Error formatting or sending ASR result: {e}")
+                                    error_response = TranscriptionResponse(
+                                        code=500,
+                                        info=f"Error formatting result: {str(e)}",
+                                        data=""
+                                    )
+                                    try:
+                                        await websocket.send_json(error_response.model_dump())
+                                    except:
+                                        pass
                                 
                         # logger.debug(f'last_vad_beg: {last_vad_beg}; last_vad_end: {last_vad_end} len(audio_vad): {len(audio_vad)}')
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")
     except Exception as e:
-        logger.error(f"Unexpected error: {e}\nCall stack:\n{traceback.format_exc()}")
-        await websocket.close()
+        logger.error(f"Unexpected error in WebSocket endpoint: {e}\nCall stack:\n{traceback.format_exc()}")
+        try:
+            error_response = TranscriptionResponse(
+                code=500,
+                info=f"Internal server error: {str(e)}",
+                data=""
+            )
+            await websocket.send_json(error_response.model_dump())
+        except:
+            pass
+        try:
+            await websocket.close()
+        except:
+            pass
     finally:
         audio_buffer = np.array([], dtype=np.float32)
         audio_vad = np.array([], dtype=np.float32)
         cache.clear()
+        cache_asr.clear()
         logger.info("Cleaned up resources after WebSocket disconnect")
 
 
