@@ -16,6 +16,7 @@ import argparse
 import uvicorn
 import time
 import logging
+from datetime import datetime
 
 # Set up logging
 logging.basicConfig(level=logging.ERROR)
@@ -197,6 +198,24 @@ class TranscriptionResponse(BaseModel):
     code: int
     msg: str
     data: str
+
+
+@app.get("/")
+async def root():
+    """Root path"""
+    return {
+        "version": '0.0.1',
+        "status": "running"
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """Health check"""
+    return {
+        "status": "health",
+        "timestamp": datetime.now().isoformat(),
+    }
 
 @app.post("/transcribe", response_model=TranscriptionResponse)
 async def transcribe_audio(file: UploadFile = File(...)):
