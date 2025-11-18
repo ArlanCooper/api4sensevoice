@@ -1073,37 +1073,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # ==================== 主程序入口 ====================
 if __name__ == "__main__":
-    # 当脚本直接运行时执行（不是被导入为模块时）
-    # 这是Python的标准入口点检查
-    
     parser = argparse.ArgumentParser(description="Run the FastAPI app with a specified port.")
-    # 创建命令行参数解析器
-    # description: 程序的描述信息，会在帮助信息中显示
-    
     parser.add_argument('--port', type=int, default=8034, help='Port number to run the FastAPI app on.')
-    # 添加端口参数：
-    # --port: 命令行参数名称（使用--表示可选参数）
-    # type=int: 参数类型为整数
-    # default=8034: 默认值为8034
-    # help: 参数的帮助信息，会在--help时显示
-    
-    # 注释掉的SSL证书参数（用于HTTPS/WSS支持）：
-    # parser.add_argument('--certfile', type=str, default='path_to_your_SSL_certificate_file.crt', help='SSL certificate file')
-    # parser.add_argument('--keyfile', type=str, default='path_to_your_SSL_certificate_file.key', help='SSL key file')
-    # 如果需要启用SSL/TLS加密，可以取消注释并配置证书文件路径
     
     args = parser.parse_args()
-    # 解析命令行参数
-    # 将命令行参数解析为args对象，可以通过args.port访问端口值
-    
-    # 注释掉的SSL启动方式：
-    # uvicorn.run(app, host="0.0.0.0", port=args.port, ssl_certfile=args.certfile, ssl_keyfile=args.keyfile)
-    # 如果启用SSL，使用此方式启动（支持WSS加密WebSocket连接）
-    
     uvicorn.run(app, host="0.0.0.0", port=args.port)
-    # 启动uvicorn ASGI服务器
-    # app: FastAPI应用实例
-    # host="0.0.0.0": 监听所有网络接口（允许从任何IP地址访问）
-    #   如果只想本地访问，可以改为"127.0.0.1"或"localhost"
-    # port=args.port: 使用命令行指定的端口（默认8034）
-    # 服务器启动后会持续运行，直到被中断（Ctrl+C）
